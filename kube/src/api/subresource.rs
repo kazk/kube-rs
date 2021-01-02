@@ -16,6 +16,7 @@ pub use kube_core::subresource::{EvictParams, LogParams};
 
 pub use k8s_openapi::api::autoscaling::v1::{Scale, ScaleSpec, ScaleStatus};
 
+#[cfg(feature = "ws")] use crate::api::portforward::Portforwarder;
 #[cfg(feature = "ws")] use crate::api::remote_command::AttachedProcess;
 
 /// Methods for [scale subresource](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#scale-subresource).
@@ -296,5 +297,75 @@ where
         let req = self.request.exec(name, command, ap)?;
         let stream = self.client.connect(req).await?;
         Ok(AttachedProcess::new(stream, ap))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Portforward subresource
+// ----------------------------------------------------------------------------
+#[cfg(feature = "ws")]
+impl Resource {
+    /// Request to forward ports of a pod
+    pub fn portforward(&self, name: &str, ports: &[u16]) -> Result<http::Request<Vec<u8>>> {
+        // TODO Validate that the number of ports is < 128. Channel is u8 and each port need 2 channels.
+        if ports.is_empty() {
+            return Err(Error::RequestValidation("ports cannot be empty".into()));
+        }
+
+        if ports.len() > 1 {
+            let mut seen = std::collections::HashSet::with_capacity(ports.len());
+            for port in ports.iter() {
+                if seen.contains(port) {
+                    return Err(Error::RequestValidation(format!(
+                        "ports must be unique, found multiple {}",
+                        port
+                    )));
+                }
+                seen.insert(port);
+            }
+        }
+
+        let base_url = format!("{}/{}/portforward?", self.make_url(), name);
+        let mut qp = url::form_urlencoded::Serializer::new(base_url);
+        qp.append_pair(
+            "ports",
+            &ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+        );
+
+        let req = http::Request::get(qp.finish());
+        req.body(vec![]).map_err(Error::HttpError)
+    }
+}
+
+#[cfg(feature = "ws")]
+#[test]
+fn portforward_path() {
+    use crate::api::Resource;
+    use k8s_openapi::api::core::v1 as corev1;
+    let r = Resource::namespaced::<corev1::Pod>("ns");
+    let req = r.portforward("foo", &[80, 1234]).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/pods/foo/portforward?&ports=80%2C1234"
+    );
+}
+
+/// Marker trait for objects that has portforward
+#[cfg(feature = "ws")]
+pub trait Portforwardable {}
+
+#[cfg(feature = "ws")]
+impl Portforwardable for k8s_openapi::api::core::v1::Pod {}
+
+#[cfg(feature = "ws")]
+impl<K> Api<K>
+where
+    K: Clone + DeserializeOwned + Portforwardable,
+{
+    /// Forward ports of a pod
+    pub async fn portforward(&self, name: &str, ports: &[u16]) -> Result<Portforwarder> {
+        let req = self.resource.portforward(name, ports)?;
+        let stream = self.client.connect(req).await?;
+        Ok(Portforwarder::new(stream, ports))
     }
 }
